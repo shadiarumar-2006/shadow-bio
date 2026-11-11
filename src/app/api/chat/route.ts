@@ -1,6 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import ZAI from "z-ai-web-dev-sdk";
-
 const SYSTEM_PROMPTS: Record<string, string> = {
   en: `You are the Shadow Bio Endocrinology Assistant, an AI specialized in endocrinology — the study of hormones and the endocrine system. You work for the "Endocrinology Department" of Shadow Bio.
 
@@ -69,11 +67,17 @@ const LANG_NAMES: Record<string, string> = {
 
 export async function POST(req: NextRequest) {
   try {
+    const apiKey = process.env.GROQ_API_KEY;
+
+    if (!apiKey) {
+      return NextResponse.json(
+        { error: "GROQ_API_KEY is not configured" },
+        { status: 500 }
+      );
+    }
+
     const body = await req.json();
-    const { messages, lang = "en" } = body as {
-      messages: { role: string; content: string }[];
-      lang?: string;
-    };
+    const { messages, lang = "en" } = body;
 
     if (!Array.isArray(messages) || messages.length === 0) {
       return NextResponse.json(
@@ -82,45 +86,70 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Initialize ZAI — supports env vars for production deployment (Vercel, Netlify, etc.)
-    // Falls back to .z-ai-config file in development.
-    const zaiOpts: { baseUrl?: string; apiKey?: string } = {};
-    if (process.env.ZAI_BASE_URL) zaiOpts.baseUrl = process.env.ZAI_BASE_URL;
-    if (process.env.ZAI_API_KEY) zaiOpts.apiKey = process.env.ZAI_API_KEY;
-    const zai = await ZAI.create(
-      Object.keys(zaiOpts).length > 0 ? zaiOpts : undefined
+    const safeMessages = messages.slice(-12).map(
+      (m: { role?: string; content?: unknown }) => ({
+        role: m.role === "assistant" ? "assistant" : "user",
+        content: String(m.content ?? "").slice(0, 4000),
+      })
     );
-    const systemPrompt = SYSTEM_PROMPTS[lang] || SYSTEM_PROMPTS.en;
 
-    const completion = await zai.chat.completions.create({
-      messages: [
-        { role: "system", content: systemPrompt },
-        ...messages.map((m) => ({
-          role: m.role === "assistant" ? "assistant" : "user",
-          content: String(m.content || ""),
-        })),
-      ],
-      thinking: { type: "disabled" },
-      temperature: 0.5,
-      max_tokens: 1500,
-    });
+    const response = await fetch(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "llama-3.3-70b-versatile",
+          messages: [
+            {
+              role: "system",
+              content: SYSTEM_PROMPTS[lang] || SYSTEM_PROMPTS.en,
+            },
+            ...safeMessages,
+          ],
+          temperature: 0.5,
+          max_tokens: 1500,
+        }),
+        signal: AbortSignal.timeout(25000),
+      }
+    );
 
-    const content = completion.choices?.[0]?.message?.content || "";
-    if (!content) {
+    if (!response.ok) {
+      console.error("Groq API error:", response.status);
+
       return NextResponse.json(
-        { error: "Empty AI response", reply: "" },
+        {
+          error: "AI service unavailable. Please try again.",
+        },
+        { status: response.status === 429 ? 429 : 502 }
+      );
+    }
+
+    const data = await response.json();
+    const reply = data.choices?.[0]?.message?.content;
+
+    if (!reply) {
+      return NextResponse.json(
+        { error: "Empty AI response" },
         { status: 502 }
       );
     }
 
     return NextResponse.json({
-      reply: content,
-      lang: LANG_NAMES[lang] || lang,
+      reply,
+      lang: LANG_NAMES[lang] || "English",
     });
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : "Unknown error";
-    console.error("[shadow-bio chat] error:", msg);
-    return NextResponse.json({ error: msg }, { status: 500 });
+
+  } catch (error) {
+    console.error("Shadow Bio AI error:", error);
+
+    return NextResponse.json(
+      { error: "Unable to process your request" },
+      { status: 500 }
+    );
   }
 }
 
@@ -129,6 +158,6 @@ export async function GET() {
     name: "Shadow Bio Endocrinology AI",
     status: "ready",
     languages: ["en", "ar", "ku"],
-    specialization: "endocrinology",
+    provider: "Groq",
   });
 }
